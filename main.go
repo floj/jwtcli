@@ -47,9 +47,9 @@ func printJwt(jwt []byte, out io.Writer) error {
 
 	for partType, part := range map[string][]byte{"header": parts[0], "payload": parts[1]} {
 		dec := make([]byte, len(part))
-		n, err := base64.URLEncoding.Decode(dec, part)
+		n, err := base64.RawURLEncoding.Decode(dec, part)
 		if err != nil {
-			return fmt.Errorf("failed to url-decode %s: %w", partType, err)
+			return fmt.Errorf("failed to base64-decode %s: %w", partType, err)
 		}
 		dec = dec[:n]
 		obj := map[string]any{}
