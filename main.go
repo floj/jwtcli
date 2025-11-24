@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/hokaccha/go-prettyjson"
 )
@@ -66,6 +67,20 @@ func printJwt(jwt []byte, out io.Writer) error {
 		}
 		if _, err := out.Write([]byte{'\n'}); err != nil {
 			return err
+		}
+		if partType == "payload" {
+			for _, e := range []string{"iat", "nbf", "exp"} {
+				v, set := obj[e]
+				if !set {
+					continue
+				}
+				f, ok := v.(float64)
+				if !ok {
+					return fmt.Errorf("expected %s to be a number, got %T", e, v)
+				}
+				t := time.Unix(int64(f), 0)
+				fmt.Fprintf(out, "# %s: %v\n", e, t)
+			}
 		}
 	}
 	return nil
