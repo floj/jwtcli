@@ -79,7 +79,7 @@ func printJwt(jwt []byte, out io.Writer) error {
 					return fmt.Errorf("expected %s to be a number, got %T", e, v)
 				}
 				t := time.Unix(int64(f), 0)
-				fmt.Fprintf(out, "# %s: %v\n", e, t)
+				fmt.Fprintf(out, "// %s: %v\n", e, t)
 			}
 		}
 	}
