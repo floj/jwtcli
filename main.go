@@ -60,9 +60,13 @@ func main() {
 			if len(tokens) == 0 {
 				buf := bytes.Buffer{}
 				if _, err := io.Copy(&buf, os.Stdin); err != nil {
-					return fmt.Errorf("could not read from stdin: %v\n", err)
+					return fmt.Errorf("could not read from stdin: %w\n", err)
 				}
-				tokens = append(tokens, buf.String())
+				token := strings.TrimSpace(buf.String())
+				if token == "" {
+					return fmt.Errorf("no JWT token provided via arguments or stdin")
+				}
+				tokens = append(tokens, token)
 			}
 
 			// disable color if output is not a terminal
