@@ -36,6 +36,11 @@ func main() {
 
 }
 
+type timeField struct {
+	name  string
+	value time.Time
+}
+
 func printJwt(jwt []byte, out io.Writer) error {
 	dots := bytes.Count(jwt, []byte{'.'})
 	if dots != 2 {
@@ -46,6 +51,7 @@ func printJwt(jwt []byte, out io.Writer) error {
 
 	pjson := prettyjson.NewFormatter()
 
+	times := []timeField{}
 	for partType, part := range map[string][]byte{"header": parts[0], "payload": parts[1]} {
 		dec := make([]byte, len(part))
 		n, err := base64.RawURLEncoding.Decode(dec, part)
@@ -79,9 +85,20 @@ func printJwt(jwt []byte, out io.Writer) error {
 					return fmt.Errorf("expected %s to be a number, got %T", e, v)
 				}
 				t := time.Unix(int64(f), 0)
-				fmt.Fprintf(out, "// %s: %v\n", e, t)
+				times = append(times, timeField{name: e, value: t})
 			}
 		}
+	}
+
+	for _, tf := range times {
+		timeDiff := ""
+		now := time.Now()
+		if tf.value.Before(now) {
+			timeDiff = fmt.Sprintf("%s ago", now.Sub(tf.value).Truncate(time.Second).String())
+		} else {
+			timeDiff = fmt.Sprintf("%s left", tf.value.Sub(now).Truncate(time.Second))
+		}
+		fmt.Fprintf(out, "// %s: %v | %s\n", tf.name, tf.value, timeDiff)
 	}
 	return nil
 }
