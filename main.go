@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,48 +17,8 @@ import (
 	"github.com/hashicorp/cap/jwt"
 	"github.com/hokaccha/go-prettyjson"
 	"github.com/mattn/go-isatty"
+	"github.com/urfave/cli/v3"
 )
-
-const (
-	httpTimeout = 5 * time.Second
-)
-
-func main() {
-	validateSignature := false
-	flag.BoolVar(&validateSignature, "sig", false, "Validate the JWT signature")
-	flag.Parse()
-
-	args := flag.Args()
-	tokens := [][]byte{}
-
-	// read tokens from stdin if no args are provided
-	if len(args) == 0 {
-		token, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not read from stdin: %v\n", err)
-			os.Exit(1)
-		}
-		tokens = append(tokens, token)
-	} else {
-		for _, t := range args {
-			tokens = append(tokens, []byte(t))
-		}
-	}
-
-	// disable color if output is not a terminal
-	color.NoColor = !isatty.IsTerminal(os.Stdout.Fd())
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	for _, t := range tokens {
-		if err := printJwt(ctx, t, os.Stdout, validateSignature); err != nil {
-			fmt.Fprintf(os.Stderr, "could not parse JWT: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-}
 
 type jwtTimes struct {
 	iat *time.Time
@@ -67,7 +26,78 @@ type jwtTimes struct {
 	exp *time.Time
 }
 
-func printJwt(ctx context.Context, token []byte, out io.Writer, validateSignature bool) error {
+type jwtOpts struct {
+	verifySig   bool
+	httpTimeout time.Duration
+}
+
+func main() {
+	cmd := &cli.Command{
+		Name:  "jwt",
+		Usage: "Simple JWT inspection tool",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "verify-signature",
+				Aliases: []string{"sig"},
+				Usage:   "Validate the JWT signature using the issuer's JWKs",
+				Sources: cli.EnvVars("VALIDATE_SIGNATURE"),
+			},
+			&cli.DurationFlag{
+				Name:    "http-timeout",
+				Usage:   "Timeout for HTTP requests when fetching JWKs",
+				Value:   5 * time.Second,
+				Sources: cli.EnvVars("HTTP_TIMEOUT"),
+			},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			verifySig := c.Bool("verify-signature")
+			httpTimeout := c.Duration("http-timeout")
+
+			tokens := [][]byte{}
+
+			args := c.Args().Slice()
+			// read tokens from stdin if no args are provided
+			if len(args) == 0 {
+				token, err := io.ReadAll(os.Stdin)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "could not read from stdin: %v\n", err)
+					os.Exit(1)
+				}
+				tokens = append(tokens, token)
+			} else {
+				for _, t := range args {
+					tokens = append(tokens, []byte(t))
+				}
+			}
+
+			// disable color if output is not a terminal
+			color.NoColor = !isatty.IsTerminal(os.Stdout.Fd())
+
+			opts := jwtOpts{
+				verifySig:   verifySig,
+				httpTimeout: httpTimeout,
+			}
+			for _, t := range tokens {
+				if err := printJwt(ctx, t, os.Stdout, opts); err != nil {
+					fmt.Fprintf(os.Stderr, "could not parse JWT: %v\n", err)
+					os.Exit(1)
+				}
+			}
+
+			return nil
+		},
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	if err := cmd.Run(ctx, os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}
+
+func printJwt(ctx context.Context, token []byte, out io.Writer, opts jwtOpts) error {
 	token = bytes.TrimSpace(token)
 	dots := bytes.Count(token, []byte{'.'})
 	if dots != 2 {
@@ -168,8 +198,8 @@ func printJwt(ctx context.Context, token []byte, out io.Writer, validateSignatur
 		fmt.Fprintf(out, "// exp: %v | %s\n", times.exp, relTime)
 	}
 
-	if validateSignature {
-		err := validateJWTSignature(ctx, token, iss)
+	if opts.verifySig {
+		err := validateJWTSignature(ctx, token, iss, opts.httpTimeout)
 		sigResult := colorOk("VALID")
 		if err != nil {
 			sigResult = colorNok("INVALID (", err, ")")
@@ -179,7 +209,7 @@ func printJwt(ctx context.Context, token []byte, out io.Writer, validateSignatur
 	return nil
 }
 
-func validateJWTSignature(ctx context.Context, token []byte, issuer string) error {
+func validateJWTSignature(ctx context.Context, token []byte, issuer string, httpTimeout time.Duration) error {
 	if issuer == "" {
 		return fmt.Errorf("issuer is empty")
 	}
@@ -191,7 +221,7 @@ func validateJWTSignature(ctx context.Context, token []byte, issuer string) erro
 	}
 
 	wellKnownURL := issURL.JoinPath(".well-known", "openid-configuration").String()
-	jwksURI, err := fetchJWKSURI(ctx, wellKnownURL)
+	jwksURI, err := fetchJWKsURI(ctx, wellKnownURL, httpTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to fetch OpenID configuration: %w", err)
 	}
@@ -208,7 +238,7 @@ func validateJWTSignature(ctx context.Context, token []byte, issuer string) erro
 	return nil
 }
 
-func fetchJWKSURI(ctx context.Context, wellKnownURL string) (string, error) {
+func fetchJWKsURI(ctx context.Context, wellKnownURL string, httpTimeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 
