@@ -22,6 +22,9 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
+// version is set at build time via -ldflags
+var version = "dev"
+
 type jwtTimes struct {
 	iat *time.Time
 	nbf *time.Time
@@ -35,8 +38,9 @@ type jwtOpts struct {
 
 func main() {
 	cmd := &cli.Command{
-		Name:  "jwt",
-		Usage: "Simple JWT inspection tool",
+		Name:    "jwt",
+		Usage:   "Simple JWT inspection tool",
+		Version: version,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:    "verify-signature",
