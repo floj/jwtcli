@@ -2,19 +2,35 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"time"
 
+	"github.com/fatih/color"
+	"github.com/hashicorp/cap/jwt"
 	"github.com/hokaccha/go-prettyjson"
+	"github.com/mattn/go-isatty"
 )
 
 func main() {
+
+	validateSignature := false
+	flag.BoolVar(&validateSignature, "sig", false, "Validate the JWT signature")
+	flag.Parse()
+
+	args := flag.Args()
 	tokens := [][]byte{}
-	if len(os.Args) == 1 {
+
+	// read tokens from stdin if no args are provided
+	if len(args) == 0 {
 		jwt, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "could read from stdin: %v", err)
@@ -22,13 +38,19 @@ func main() {
 		}
 		tokens = append(tokens, jwt)
 	} else {
-		for _, t := range os.Args[1:] {
+		for _, t := range args {
 			tokens = append(tokens, []byte(t))
 		}
 	}
 
+	// disable color if output is not a terminal
+	color.NoColor = !isatty.IsTerminal(os.Stdout.Fd())
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
 	for _, t := range tokens {
-		if err := printJwt(t, os.Stdout); err != nil {
+		if err := printJwt(ctx, t, os.Stdout, validateSignature); err != nil {
 			fmt.Fprintf(os.Stderr, "could not parse JWT: %v", err)
 			os.Exit(1)
 		}
@@ -36,23 +58,29 @@ func main() {
 
 }
 
-type timeField struct {
-	name  string
-	value time.Time
+type jwtTimes struct {
+	iat time.Time
+	nbf time.Time
+	exp time.Time
 }
 
-func printJwt(jwt []byte, out io.Writer) error {
-	dots := bytes.Count(jwt, []byte{'.'})
+func printJwt(ctx context.Context, jwtToken []byte, out io.Writer, validateSignature bool) error {
+	dots := bytes.Count(jwtToken, []byte{'.'})
 	if dots != 2 {
 		return fmt.Errorf("jwt must contain exactly 2 dots, but found %d", dots)
 	}
-	parts := bytes.Split(jwt, []byte{'.'})
+	parts := bytes.Split(jwtToken, []byte{'.'})
 	// 0 = header, 1 = payload, 2 = signature
+	partTypes := []string{"header", "payload", "signature"}
 
 	pjson := prettyjson.NewFormatter()
 
-	times := []timeField{}
-	for partType, part := range map[string][]byte{"header": parts[0], "payload": parts[1]} {
+	iss := ""
+	times := jwtTimes{}
+	for i := range parts[0:2] {
+		part := parts[i]
+		partType := partTypes[i]
+
 		dec := make([]byte, len(part))
 		n, err := base64.RawURLEncoding.Decode(dec, part)
 		if err != nil {
@@ -75,6 +103,7 @@ func printJwt(jwt []byte, out io.Writer) error {
 			return err
 		}
 		if partType == "payload" {
+			iss, _ = obj["iss"].(string)
 			for _, e := range []string{"iat", "nbf", "exp"} {
 				v, set := obj[e]
 				if !set {
@@ -85,20 +114,125 @@ func printJwt(jwt []byte, out io.Writer) error {
 					return fmt.Errorf("expected %s to be a number, got %T", e, v)
 				}
 				t := time.Unix(int64(f), 0)
-				times = append(times, timeField{name: e, value: t})
+				switch e {
+				case "iat":
+					times.iat = t
+				case "nbf":
+					times.nbf = t
+				case "exp":
+					times.exp = t
+				}
 			}
 		}
 	}
 
-	for _, tf := range times {
-		timeDiff := ""
-		now := time.Now()
-		if tf.value.Before(now) {
-			timeDiff = fmt.Sprintf("%s ago", now.Sub(tf.value).Truncate(time.Second).String())
-		} else {
-			timeDiff = fmt.Sprintf("%s left", tf.value.Sub(now).Truncate(time.Second))
+	colorOk := color.New(color.FgGreen).SprintFunc()
+	colorNok := color.New(color.FgRed).SprintFunc()
+
+	now := time.Now()
+	if !times.iat.IsZero() {
+		diff := times.iat.Sub(now).Truncate(time.Second)
+		diffWord := "left"
+		if diff < 0 {
+			diffWord = "ago"
 		}
-		fmt.Fprintf(out, "// %s: %v | %s\n", tf.name, tf.value, timeDiff)
+		fmt.Fprintf(out, "// iat: %v | %s %s\n", times.iat, diff.Abs(), diffWord)
+	}
+
+	if !times.nbf.IsZero() {
+		diff := times.nbf.Sub(now).Truncate(time.Second)
+		c := colorOk
+		diffWord := "ago"
+		if diff >= 0 {
+			diffWord = "left"
+			c = colorNok
+		}
+		relTime := c(diff.Abs(), " ", diffWord)
+		fmt.Fprintf(out, "// nbf: %v | %s\n", times.nbf, relTime)
+	}
+
+	if !times.exp.IsZero() {
+		diff := times.exp.Sub(now).Truncate(time.Second)
+		diffWord := "left"
+		c := colorOk
+		if diff < 0 {
+			diffWord = "ago"
+			c = colorNok
+		}
+		relTime := c(diff.Abs(), " ", diffWord)
+		fmt.Fprintf(out, "// exp: %v | %s\n", times.exp, relTime)
+	}
+
+	if validateSignature {
+		err := validateJWTSignature(ctx, jwtToken, iss)
+		sigResult := colorOk("VALID")
+		if err != nil {
+			sigResult = colorNok("INVALID (", err, ")")
+		}
+		fmt.Fprintf(out, "// signature: %s\n", sigResult)
 	}
 	return nil
+}
+
+func validateJWTSignature(ctx context.Context, jwtToken []byte, issuer string) error {
+	if issuer == "" {
+		return fmt.Errorf("issuer is empty")
+	}
+
+	// Fetch OpenID configuration from well-known URL
+	issURL, err := url.Parse(issuer)
+	if err != nil {
+		return fmt.Errorf("invalid issuer URL: %w", err)
+	}
+
+	wellKnownURL := issURL.JoinPath(".well-known", "openid-configuration").String()
+	jwksURI, err := fetchJWKSURI(ctx, wellKnownURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch OpenID configuration: %w", err)
+	}
+
+	keySet, err := jwt.NewJSONWebKeySet(ctx, jwksURI, "")
+	if err != nil {
+		return fmt.Errorf("failed to fetch JWKS: %w", err)
+	}
+
+	if _, err := keySet.VerifySignature(ctx, string(jwtToken)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func fetchJWKSURI(ctx context.Context, wellKnownURL string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	config := struct {
+		JWKsURI string `json:"jwks_uri"`
+	}{}
+
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return "", err
+	}
+
+	if config.JWKsURI == "" {
+		return "", fmt.Errorf("jwks_uri not found in OpenID configuration")
+	}
+
+	return config.JWKsURI, nil
 }
