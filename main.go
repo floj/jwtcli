@@ -20,8 +20,11 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-func main() {
+const (
+	httpTimeout = 5 * time.Second
+)
 
+func main() {
 	validateSignature := false
 	flag.BoolVar(&validateSignature, "sig", false, "Validate the JWT signature")
 	flag.Parse()
@@ -31,12 +34,12 @@ func main() {
 
 	// read tokens from stdin if no args are provided
 	if len(args) == 0 {
-		jwt, err := io.ReadAll(os.Stdin)
+		token, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "could read from stdin: %v", err)
+			fmt.Fprintf(os.Stderr, "could not read from stdin: %v\n", err)
 			os.Exit(1)
 		}
-		tokens = append(tokens, jwt)
+		tokens = append(tokens, token)
 	} else {
 		for _, t := range args {
 			tokens = append(tokens, []byte(t))
@@ -51,7 +54,7 @@ func main() {
 
 	for _, t := range tokens {
 		if err := printJwt(ctx, t, os.Stdout, validateSignature); err != nil {
-			fmt.Fprintf(os.Stderr, "could not parse JWT: %v", err)
+			fmt.Fprintf(os.Stderr, "could not parse JWT: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -59,17 +62,18 @@ func main() {
 }
 
 type jwtTimes struct {
-	iat time.Time
-	nbf time.Time
-	exp time.Time
+	iat *time.Time
+	nbf *time.Time
+	exp *time.Time
 }
 
-func printJwt(ctx context.Context, jwtToken []byte, out io.Writer, validateSignature bool) error {
-	dots := bytes.Count(jwtToken, []byte{'.'})
+func printJwt(ctx context.Context, token []byte, out io.Writer, validateSignature bool) error {
+	token = bytes.TrimSpace(token)
+	dots := bytes.Count(token, []byte{'.'})
 	if dots != 2 {
 		return fmt.Errorf("jwt must contain exactly 2 dots, but found %d", dots)
 	}
-	parts := bytes.Split(jwtToken, []byte{'.'})
+	parts := bytes.Split(token, []byte{'.'})
 	// 0 = header, 1 = payload, 2 = signature
 	partTypes := []string{"header", "payload", "signature"}
 
@@ -116,11 +120,11 @@ func printJwt(ctx context.Context, jwtToken []byte, out io.Writer, validateSigna
 				t := time.Unix(int64(f), 0)
 				switch e {
 				case "iat":
-					times.iat = t
+					times.iat = &t
 				case "nbf":
-					times.nbf = t
+					times.nbf = &t
 				case "exp":
-					times.exp = t
+					times.exp = &t
 				}
 			}
 		}
@@ -130,41 +134,42 @@ func printJwt(ctx context.Context, jwtToken []byte, out io.Writer, validateSigna
 	colorNok := color.New(color.FgRed).SprintFunc()
 
 	now := time.Now()
-	if !times.iat.IsZero() {
+	if times.iat != nil {
 		diff := times.iat.Sub(now).Truncate(time.Second)
 		diffWord := "left"
 		if diff < 0 {
 			diffWord = "ago"
 		}
-		fmt.Fprintf(out, "// iat: %v | %s %s\n", times.iat, diff.Abs(), diffWord)
+		relTime := fmt.Sprint(diff.Abs(), " ", diffWord)
+		fmt.Fprintf(out, "// iat: %v | %s\n", times.iat, relTime)
 	}
 
-	if !times.nbf.IsZero() {
+	if times.nbf != nil {
 		diff := times.nbf.Sub(now).Truncate(time.Second)
-		c := colorOk
+		colorFn := colorOk
 		diffWord := "ago"
 		if diff >= 0 {
 			diffWord = "left"
-			c = colorNok
+			colorFn = colorNok
 		}
-		relTime := c(diff.Abs(), " ", diffWord)
+		relTime := colorFn(diff.Abs(), " ", diffWord)
 		fmt.Fprintf(out, "// nbf: %v | %s\n", times.nbf, relTime)
 	}
 
-	if !times.exp.IsZero() {
+	if times.exp != nil {
 		diff := times.exp.Sub(now).Truncate(time.Second)
 		diffWord := "left"
-		c := colorOk
+		colorFn := colorOk
 		if diff < 0 {
 			diffWord = "ago"
-			c = colorNok
+			colorFn = colorNok
 		}
-		relTime := c(diff.Abs(), " ", diffWord)
+		relTime := colorFn(diff.Abs(), " ", diffWord)
 		fmt.Fprintf(out, "// exp: %v | %s\n", times.exp, relTime)
 	}
 
 	if validateSignature {
-		err := validateJWTSignature(ctx, jwtToken, iss)
+		err := validateJWTSignature(ctx, token, iss)
 		sigResult := colorOk("VALID")
 		if err != nil {
 			sigResult = colorNok("INVALID (", err, ")")
@@ -174,7 +179,7 @@ func printJwt(ctx context.Context, jwtToken []byte, out io.Writer, validateSigna
 	return nil
 }
 
-func validateJWTSignature(ctx context.Context, jwtToken []byte, issuer string) error {
+func validateJWTSignature(ctx context.Context, token []byte, issuer string) error {
 	if issuer == "" {
 		return fmt.Errorf("issuer is empty")
 	}
@@ -196,7 +201,7 @@ func validateJWTSignature(ctx context.Context, jwtToken []byte, issuer string) e
 		return fmt.Errorf("failed to fetch JWKS: %w", err)
 	}
 
-	if _, err := keySet.VerifySignature(ctx, string(jwtToken)); err != nil {
+	if _, err := keySet.VerifySignature(ctx, string(token)); err != nil {
 		return err
 	}
 
@@ -204,7 +209,7 @@ func validateJWTSignature(ctx context.Context, jwtToken []byte, issuer string) e
 }
 
 func fetchJWKSURI(ctx context.Context, wellKnownURL string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
