@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -53,21 +55,14 @@ func main() {
 			verifySig := c.Bool("verify-signature")
 			httpTimeout := c.Duration("http-timeout")
 
-			tokens := [][]byte{}
-
-			args := c.Args().Slice()
+			tokens := c.Args().Slice()
 			// read tokens from stdin if no args are provided
-			if len(args) == 0 {
-				token, err := io.ReadAll(os.Stdin)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "could not read from stdin: %v\n", err)
-					os.Exit(1)
+			if len(tokens) == 0 {
+				buf := bytes.Buffer{}
+				if _, err := io.Copy(&buf, os.Stdin); err != nil {
+					return fmt.Errorf("could not read from stdin: %v\n", err)
 				}
-				tokens = append(tokens, token)
-			} else {
-				for _, t := range args {
-					tokens = append(tokens, []byte(t))
-				}
+				tokens = append(tokens, buf.String())
 			}
 
 			// disable color if output is not a terminal
@@ -77,14 +72,16 @@ func main() {
 				verifySig:   verifySig,
 				httpTimeout: httpTimeout,
 			}
+
+			errs := []error{}
 			for _, t := range tokens {
 				if err := printJwt(ctx, t, os.Stdout, opts); err != nil {
+					errs = append(errs, err)
 					fmt.Fprintf(os.Stderr, "could not parse JWT: %v\n", err)
-					os.Exit(1)
 				}
 			}
 
-			return nil
+			return errors.Join(errs...)
 		},
 	}
 
@@ -97,13 +94,12 @@ func main() {
 	}
 }
 
-func printJwt(ctx context.Context, token []byte, out io.Writer, opts jwtOpts) error {
-	token = bytes.TrimSpace(token)
-	dots := bytes.Count(token, []byte{'.'})
-	if dots != 2 {
-		return fmt.Errorf("jwt must contain exactly 2 dots, but found %d", dots)
+func printJwt(ctx context.Context, token string, out io.Writer, opts jwtOpts) error {
+	token = strings.TrimSpace(token)
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("jwt must contain exactly 3 parts, but found %d", len(parts))
 	}
-	parts := bytes.Split(token, []byte{'.'})
 	// 0 = header, 1 = payload, 2 = signature
 	partTypes := []string{"header", "payload", "signature"}
 
@@ -115,12 +111,11 @@ func printJwt(ctx context.Context, token []byte, out io.Writer, opts jwtOpts) er
 		part := parts[i]
 		partType := partTypes[i]
 
-		dec := make([]byte, len(part))
-		n, err := base64.RawURLEncoding.Decode(dec, part)
+		dec, err := base64.RawURLEncoding.DecodeString(part)
 		if err != nil {
 			return fmt.Errorf("failed to base64-decode %s: %w", partType, err)
 		}
-		dec = dec[:n]
+
 		obj := map[string]any{}
 		err = json.Unmarshal(dec, &obj)
 		if err != nil {
@@ -209,7 +204,7 @@ func printJwt(ctx context.Context, token []byte, out io.Writer, opts jwtOpts) er
 	return nil
 }
 
-func validateJWTSignature(ctx context.Context, token []byte, issuer string, httpTimeout time.Duration) error {
+func validateJWTSignature(ctx context.Context, token, issuer string, httpTimeout time.Duration) error {
 	if issuer == "" {
 		return fmt.Errorf("issuer is empty")
 	}
@@ -231,7 +226,7 @@ func validateJWTSignature(ctx context.Context, token []byte, issuer string, http
 		return fmt.Errorf("failed to fetch JWKS: %w", err)
 	}
 
-	if _, err := keySet.VerifySignature(ctx, string(token)); err != nil {
+	if _, err := keySet.VerifySignature(ctx, token); err != nil {
 		return err
 	}
 
